@@ -390,9 +390,9 @@ class TransactionService:
         #    raise InvalidProxyContract(safe_address)
 
         # Make sure master copy is valid
-        safe_master_copy_address = safe.retrieve_master_copy_address()
-        if safe_master_copy_address not in self.safe_valid_contract_addresses:
-            raise InvalidMasterCopyAddress(safe_master_copy_address)
+        # safe_master_copy_address = safe.retrieve_master_copy_address()
+        # if safe_master_copy_address not in self.safe_valid_contract_addresses:
+        #     raise InvalidMasterCopyAddress(safe_master_copy_address)
 
         # Check enough funds to pay for the gas
         if not safe.check_funds_for_tx_gas(safe_tx_gas, base_gas, gas_price, gas_token):
