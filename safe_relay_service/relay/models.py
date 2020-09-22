@@ -1,4 +1,5 @@
 import datetime
+from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
@@ -6,8 +7,9 @@ from django.contrib.postgres.fields import ArrayField, JSONField
 from django.db import models
 from django.db.models import (Avg, Case, Count, DurationField, F, Q, Sum,
                               Value, When)
-from django.db.models.expressions import OuterRef, RawSQL, Subquery, Window
-from django.db.models.functions import Cast, Coalesce, TruncDate
+from django.db.models.expressions import RawSQL, Subquery, Window
+from django.db.models.functions import Cast, TruncDate
+from django.utils import timezone
 
 from hexbytes import HexBytes
 from model_utils.models import TimeStampedModel
@@ -296,18 +298,19 @@ class EthereumTxManager(models.Manager):
 
 class EthereumTx(TimeStampedModel):
     objects = EthereumTxManager()
-    block = models.ForeignKey(EthereumBlock, on_delete=models.CASCADE, null=True, default=None,
+    block = models.ForeignKey(EthereumBlock, on_delete=models.CASCADE, null=True, blank=True, default=None,
                               related_name='txs')  # If mined
     tx_hash = Sha3HashField(unique=True, primary_key=True)
-    gas_used = Uint256Field(null=True, default=None)  # If mined
-    status = models.IntegerField(null=True, default=None, db_index=True)  # If mined. Old txs don't have `status`
-    transaction_index = models.PositiveIntegerField(null=True, default=None)  # If mined
+    gas_used = Uint256Field(null=True, blank=True, default=None)  # If mined
+    status = models.IntegerField(null=True, blank=True,
+                                 default=None, db_index=True)  # If mined. Old txs don't have `status`
+    transaction_index = models.PositiveIntegerField(null=True, blank=True, default=None)  # If mined
     _from = EthereumAddressField(null=True, db_index=True)
     gas = Uint256Field()
     gas_price = Uint256Field()
-    data = models.BinaryField(null=True)
+    data = models.BinaryField(null=True, blank=True)
     nonce = Uint256Field()
-    to = EthereumAddressField(null=True, db_index=True)
+    to = EthereumAddressField(null=True, blank=True, db_index=True)
     value = Uint256Field()
 
     def __str__(self):
@@ -318,11 +321,19 @@ class EthereumTx(TimeStampedModel):
         if self.status is not None:
             return self.status == 1
 
+    @property
+    def fee(self) -> int:
+        return self.gas * self.gas_price
+
 
 class SafeMultisigTxManager(models.Manager):
     def get_last_nonce_for_safe(self, safe_address: str) -> Optional[int]:
-        nonce_dict = self.filter(safe=safe_address,
-                                 ethereum_tx__status=1).order_by('-nonce').values('nonce').first()
+        """
+        Get last nonce for Safe from transactions pending/executed successfully, excluding failed transactions
+        :param safe_address:
+        :return:
+        """
+        nonce_dict = self.filter(safe=safe_address).not_failed().order_by('-nonce').values('nonce').first()
         return nonce_dict['nonce'] if nonce_dict else None
 
     def get_average_execution_time(self, from_date: datetime.datetime,
@@ -390,29 +401,58 @@ class SafeMultisigTxManager(models.Manager):
 
 
 class SafeMultisigTxQuerySet(models.QuerySet):
-    def pending(self):
-        return self.filter(ethereum_tx__block=None)
+    def failed(self):
+        """
+        :return: Mined and failed transactions
+        """
+        return self.exclude(ethereum_tx__status=None).exclude(ethereum_tx__status=1)
+
+    def not_failed(self):
+        """
+        :return: Not failed or not mined
+        """
+        return self.filter(
+            Q(ethereum_tx__status=1) | Q(ethereum_tx__status=None)  # No failed transactions, just success or not mined
+        )
+
+    def pending(self, older_than: int = 0):
+        """
+        Get multisig txs that have not been mined after `older_than` seconds
+        :param older_than: Time in seconds for a tx to be considered pending, if 0 all will be returned
+        """
+        not_mined_filter = self.filter(
+            Q(ethereum_tx__block=None) | Q(ethereum_tx=None)  # Just in case, but ethereum_tx cannot be null
+        )
+        if older_than:
+            return not_mined_filter.filter(
+                created__lte=timezone.now() - timedelta(seconds=older_than),
+            )
+        else:
+            return not_mined_filter
+
+    def successful(self):
+        """
+        :return: Mined and successful transactions
+        """
+        return self.filter(ethereum_tx__status=1)
 
 
 class SafeMultisigTx(TimeStampedModel):
     objects = SafeMultisigTxManager.from_queryset(SafeMultisigTxQuerySet)()
     safe = models.ForeignKey(SafeContract, on_delete=models.CASCADE, related_name='multisig_txs')
     ethereum_tx = models.ForeignKey(EthereumTx, on_delete=models.CASCADE, related_name='multisig_txs')
-    to = EthereumAddressField(null=True, db_index=True)
+    to = EthereumAddressField(null=True, blank=True, db_index=True)
     value = Uint256Field()
-    data = models.BinaryField(null=True)
+    data = models.BinaryField(null=True, blank=True)
     operation = models.PositiveSmallIntegerField(choices=[(tag.value, tag.name) for tag in SafeOperation])
     safe_tx_gas = Uint256Field()
     data_gas = Uint256Field()
     gas_price = Uint256Field()
-    gas_token = EthereumAddressField(null=True)
-    refund_receiver = EthereumAddressField(null=True)
+    gas_token = EthereumAddressField(null=True, blank=True)
+    refund_receiver = EthereumAddressField(null=True, blank=True)
     signatures = models.BinaryField()
     nonce = Uint256Field()
-    safe_tx_hash = Sha3HashField(unique=True, null=True)
-
-    class Meta:
-        unique_together = (('safe', 'nonce'),)
+    safe_tx_hash = Sha3HashField(unique=True, null=True, blank=True)
 
     def __str__(self):
         return '{} - {} - Safe {}'.format(self.ethereum_tx.tx_hash, SafeOperation(self.operation).name,
@@ -424,6 +464,9 @@ class SafeMultisigTx(TimeStampedModel):
                       self.refund_receiver,
                       signatures=self.signatures.tobytes() if self.signatures else b'',
                       safe_nonce=self.nonce)
+
+    def signers(self) -> List[str]:
+        return self.get_safe_tx().signers
 
 
 class SafeTxStatusQuerySet(models.QuerySet):
@@ -512,8 +555,7 @@ class EthereumEventManager(models.Manager):
                                           'from': decoded_event['args']['from'],
                                           'to': decoded_event['args']['to'],
                                           'value': decoded_event['args']['value'],
-                                      }
-                                  })
+                                      }})
 
     def get_or_create_erc721_event(self, decoded_event: Dict[str, Any]):
         return self.get_or_create(ethereum_tx_id=decoded_event['transactionHash'],
@@ -525,8 +567,7 @@ class EthereumEventManager(models.Manager):
                                           'from': decoded_event['args']['from'],
                                           'to': decoded_event['args']['to'],
                                           'tokenId': decoded_event['args']['tokenId'],
-                                      }
-                                  })
+                                      }})
 
 
 class EthereumEvent(models.Model):
@@ -548,3 +589,10 @@ class EthereumEvent(models.Model):
 
     def is_erc721(self) -> bool:
         return 'tokenId' in self.arguments
+
+
+class BannedSigner(models.Model):
+    address = EthereumAddressField(primary_key=True)
+
+    def __str__(self):
+        return self.address

@@ -1,7 +1,4 @@
-from datetime import timedelta
-
 from django.test import TestCase
-from django.utils import timezone
 
 from eth_account import Account
 from hexbytes import HexBytes
@@ -13,15 +10,20 @@ from gnosis.safe import Safe, SafeOperation
 
 from safe_relay_service.tokens.tests.factories import TokenFactory
 
+from ..models import BannedSigner
 from ..services.transaction_service import (GasPriceTooLow, InvalidGasToken,
                                             InvalidMasterCopyAddress,
+                                            InvalidOwners,
                                             InvalidProxyContract,
                                             InvalidRefundReceiver,
                                             NotEnoughFundsForMultisigTx,
                                             RefundMustBeEnabled,
                                             SafeDoesNotExist,
-                                            SignaturesNotSorted)
-from .factories import SafeContractFactory, SafeMultisigTxFactory
+                                            SafeMultisigTxExists,
+                                            SignaturesNotSorted,
+                                            SignerIsBanned)
+from .factories import (BannedSignerFactory, SafeContractFactory,
+                        SafeMultisigTxFactory)
 from .relay_test_case import RelayTestCaseMixin
 
 
@@ -57,16 +59,16 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
         refund_receiver = NULL_ADDRESS
         safe = Safe(my_safe_address, self.ethereum_client)
         nonce = safe.retrieve_nonce()
-        safe_multisig_tx_hash = safe.build_multisig_tx(to,
-                                                       value,
-                                                       data,
-                                                       operation,
-                                                       safe_tx_gas,
-                                                       data_gas,
-                                                       gas_price,
-                                                       gas_token,
-                                                       refund_receiver,
-                                                       safe_nonce=nonce).safe_tx_hash
+        safe_tx = safe.build_multisig_tx(to,
+                                         value,
+                                         data,
+                                         operation,
+                                         safe_tx_gas,
+                                         data_gas,
+                                         gas_price,
+                                         gas_token,
+                                         refund_receiver,
+                                         safe_nonce=nonce).safe_tx_hash
 
         # Just to make sure we are not miscalculating tx_hash
         contract_multisig_tx_hash = my_safe_contract.functions.getTransactionHash(
@@ -81,15 +83,15 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
             refund_receiver,
             nonce).call()
 
-        self.assertEqual(safe_multisig_tx_hash, contract_multisig_tx_hash)
+        self.assertEqual(safe_tx, contract_multisig_tx_hash)
 
-        signatures = [account.signHash(safe_multisig_tx_hash) for account in accounts]
+        signatures = [account.signHash(safe_tx) for account in accounts]
 
         # Check owners are the same
         contract_owners = my_safe_contract.functions.getOwners().call()
         self.assertEqual(set(contract_owners), set(owners))
 
-        invalid_proxy = self.deploy_example_erc20(1, NULL_ADDRESS)
+        invalid_proxy = self.deploy_example_erc20(1, Account.create().address)
         with self.assertRaises(InvalidProxyContract):
             SafeContractFactory(address=invalid_proxy.address)
             self.transaction_service.create_multisig_tx(
@@ -199,12 +201,12 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
                 operation,
                 safe_tx_gas,
                 data_gas,
-                self.transaction_service._get_minimum_gas_price() - 1,
+                self.transaction_service._estimate_tx_gas_price(self.transaction_service._get_minimum_gas_price(),
+                                                                gas_token) - 1,
                 gas_token,
                 refund_receiver,
                 nonce,
-                signatures,
-                )
+                signatures)
 
         with self.assertRaises(InvalidGasToken):
             invalid_gas_token = Account.create().address
@@ -239,6 +241,26 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
                 reversed(signatures)
             )
 
+        with self.assertRaises(SignerIsBanned):
+            for account in accounts:
+                BannedSignerFactory(address=account.address)
+            self.transaction_service.create_multisig_tx(
+                my_safe_address,
+                to,
+                value,
+                data,
+                operation,
+                safe_tx_gas,
+                data_gas,
+                gas_price,
+                gas_token,
+                refund_receiver,
+                nonce,
+                signatures
+            )
+        BannedSigner.objects.all().delete()
+        self.assertEqual(BannedSigner.objects.count(), 0)
+
         sender = self.transaction_service.tx_sender_account.address
         sender_balance = w3.eth.getBalance(sender)
         safe_balance = w3.eth.getBalance(my_safe_address)
@@ -257,6 +279,22 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
             nonce,
             signatures,
         )
+
+        with self.assertRaises(SafeMultisigTxExists):
+            self.transaction_service.create_multisig_tx(
+                my_safe_address,
+                to,
+                value,
+                data,
+                operation,
+                safe_tx_gas,
+                data_gas,
+                gas_price,
+                gas_token,
+                refund_receiver,
+                nonce,
+                signatures,
+            )
 
         tx_receipt = w3.eth.waitForTransactionReceipt(safe_multisig_tx.ethereum_tx.tx_hash)
         self.assertTrue(tx_receipt['status'])
@@ -277,19 +315,36 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
         # Send again the tx and check that works
         nonce += 1
         value = 0
-        safe_multisig_tx_hash = safe.build_multisig_tx(to,
-                                                       value,
-                                                       data,
-                                                       operation,
-                                                       safe_tx_gas,
-                                                       data_gas,
-                                                       gas_price,
-                                                       gas_token,
-                                                       refund_receiver,
-                                                       safe_nonce=nonce).safe_tx_hash
+        safe_tx = safe.build_multisig_tx(to,
+                                         value,
+                                         data,
+                                         operation,
+                                         safe_tx_gas,
+                                         data_gas,
+                                         gas_price,
+                                         gas_token,
+                                         refund_receiver,
+                                         safe_nonce=nonce)
 
-        signatures = [account.signHash(safe_multisig_tx_hash) for account in accounts]
+        # Use invalid signatures
+        with self.assertRaises(InvalidOwners):
+            signatures = [Account.create().signHash(safe_tx.safe_tx_hash) for _ in range(len(accounts))]
+            self.transaction_service.create_multisig_tx(
+                my_safe_address,
+                to,
+                value,
+                data,
+                operation,
+                safe_tx_gas,
+                data_gas,
+                gas_price,
+                gas_token,
+                refund_receiver,
+                nonce,
+                signatures,
+            )
 
+        signatures = [account.signHash(safe_tx.safe_tx_hash) for account in accounts]
         safe_multisig_tx = self.transaction_service.create_multisig_tx(
             my_safe_address,
             to,
@@ -374,21 +429,6 @@ class TestTransactionService(RelayTestCaseMixin, TestCase):
         self.assertAlmostEqual(estimation_token.gas_price, estimation_ether.gas_price // 2, delta=1.0)
         self.assertGreater(estimation_token.base_gas, estimation_ether.base_gas)
         self.assertEqual(estimation_token.gas_token, valid_token.address)
-
-    def test_get_pending_multisig_transactions(self):
-        self.assertFalse(self.transaction_service.get_pending_multisig_transactions(0))
-
-        SafeMultisigTxFactory(created=timezone.now())
-        self.assertFalse(self.transaction_service.get_pending_multisig_transactions(0))
-
-        SafeMultisigTxFactory(created=timezone.now(), ethereum_tx__block=None)
-        self.assertEqual(self.transaction_service.get_pending_multisig_transactions(0).count(), 1)
-        self.assertFalse(self.transaction_service.get_pending_multisig_transactions(30))
-
-        SafeMultisigTxFactory(created=timezone.now() - timedelta(seconds=60), ethereum_tx__block=None)
-        self.assertEqual(self.transaction_service.get_pending_multisig_transactions(30).count(), 1)
-        SafeMultisigTxFactory(created=timezone.now() - timedelta(minutes=60), ethereum_tx__block=None)
-        self.assertEqual(self.transaction_service.get_pending_multisig_transactions(30).count(), 2)
 
     def test_get_last_nonce(self):
         safe_address = self.deploy_test_safe().safe_address

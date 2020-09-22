@@ -1,13 +1,13 @@
-from typing import Optional
+from typing import List, Optional
 
 from django.contrib import admin
 from django.db.models.expressions import RawSQL
 
 from web3 import Web3
 
-from .models import (EthereumBlock, EthereumEvent, EthereumTx, SafeContract,
-                     SafeCreation, SafeCreation2, SafeFunding, SafeMultisigTx,
-                     SafeTxStatus)
+from .models import (BannedSigner, EthereumBlock, EthereumEvent, EthereumTx,
+                     SafeContract, SafeCreation, SafeCreation2, SafeFunding,
+                     SafeMultisigTx, SafeTxStatus)
 
 
 class EthereumTxForeignClassMixinAdmin:
@@ -140,23 +140,6 @@ class SafeContractDeployedListFilter(admin.SimpleListFilter):
             return queryset.deployed()
 
 
-class SafeContractBalanceListFilter(admin.SimpleListFilter):
-    title = 'Balance'
-    parameter_name = 'balance'
-
-    def lookups(self, request, model_admin):
-        return (
-            ('HAS_BALANCE', 'Has some ether'),
-            ('HAS_MORE_THAN_1_ETH', 'Has more than 1 ether'),
-        )
-
-    def queryset(self, request, queryset):
-        if self.value() == 'HAS_BALANCE':
-            return queryset.with_balance().filter(balance__gt=0)
-        elif self.value() == 'HAS_MORE_THAN_1_ETH':
-            return queryset.with_balance().filter(balance__gt=Web3.toWei(1, 'ether'))
-
-
 class SafeContractTokensListFilter(admin.SimpleListFilter):
     title = 'Tokens'
     parameter_name = 'tokens'
@@ -179,17 +162,10 @@ class SafeContractTokensListFilter(admin.SimpleListFilter):
 @admin.register(SafeContract)
 class SafeContractAdmin(admin.ModelAdmin):
     date_hierarchy = 'created'
-    list_display = ('created', 'address', 'master_copy', 'balance')
-    list_filter = ('master_copy', SafeContractDeployedListFilter,
-                   SafeContractBalanceListFilter, SafeContractTokensListFilter)
+    list_display = ('created', 'address', 'master_copy')
+    list_filter = ('master_copy', SafeContractDeployedListFilter, SafeContractTokensListFilter)
     ordering = ['-created']
     search_fields = ['address']
-
-    def get_queryset(self, request):
-        return super().get_queryset(request).with_balance()
-
-    def balance(self, obj):
-        return obj.balance
 
 
 @admin.register(SafeCreation)
@@ -201,7 +177,7 @@ class SafeCreationAdmin(admin.ModelAdmin):
     raw_id_fields = ('safe',)
     search_fields = ['=safe__address', '=deployer', 'owners']
 
-    def ether_deploy_cost(self, obj: SafeCreation):
+    def ether_deploy_cost(self, obj: SafeCreation) -> float:
         return Web3.fromWei(obj.wei_deploy_cost(), 'ether')
 
 
@@ -212,9 +188,9 @@ class SafeCreation2Admin(admin.ModelAdmin):
     list_filter = ('safe__master_copy', 'threshold', 'payment_token')
     ordering = ['-created']
     raw_id_fields = ('safe',)
-    search_fields = ['=safe__address', 'owners']
+    search_fields = ['=safe__address', 'owners', '=tx_hash']
 
-    def ether_deploy_cost(self, obj: SafeCreation):
+    def ether_deploy_cost(self, obj: SafeCreation) -> float:
         return Web3.fromWei(obj.wei_estimated_deploy_cost(), 'ether')
 
 
@@ -225,18 +201,54 @@ class SafeFundingAdmin(admin.ModelAdmin):
     raw_id_fields = ('safe',)
     search_fields = ['=safe__address']
 
-    def safe_status(self, obj: SafeFunding):
+    def safe_status(self, obj: SafeFunding) -> str:
         return obj.status()
+
+
+class SafeMultisigTxStatusListFilter(admin.SimpleListFilter):
+    # Human-readable title which will be displayed in the
+    # right admin sidebar just above the filter options.
+    title = 'Status'
+
+    # Parameter for the filter that will be used in the URL query.
+    parameter_name = 'status'
+
+    def lookups(self, request, model_admin):
+        return (
+            ('SUCCESS', 'Successful'),
+            ('FAILED', 'Failed'),
+            ('NOT_FAILED', 'Successful or not mined'),
+            ('NOT_MINED', 'Not mined'),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == 'SUCCESS':
+            return queryset.successful()
+        elif self.value() == 'FAILED':
+            return queryset.failed()
+        elif self.value() == 'NOT_FAILED':
+            return queryset.not_failed()
+        elif self.value() == 'NOT_MINED':
+            return queryset.pending()
 
 
 @admin.register(SafeMultisigTx)
 class SafeMultisigTxAdmin(admin.ModelAdmin):
     date_hierarchy = 'created'
-    list_display = ('created', 'safe_id', 'ethereum_tx_id', 'to', 'value', 'nonce', 'data')
-    list_filter = ('operation',)
+    list_display = ('created', 'safe_id', 'nonce', 'ethereum_tx_id', 'to', 'value', 'status', 'signers')
+    list_filter = ('operation', SafeMultisigTxStatusListFilter)
+    list_select_related = ('ethereum_tx',)
     ordering = ['-created']
     raw_id_fields = ('safe', 'ethereum_tx')
+    readonly_fields = ('status', 'signers')
     search_fields = ['=safe__address', '=ethereum_tx__tx_hash', 'to']
+
+    def status(self, obj: SafeMultisigTx) -> Optional[int]:
+        if obj.ethereum_tx:
+            return obj.ethereum_tx.status
+
+    def signers(self, obj: SafeMultisigTx) -> List[str]:
+        return obj.signers()
 
 
 @admin.register(SafeTxStatus)
@@ -244,3 +256,9 @@ class SafeTxStatusAdmin(admin.ModelAdmin):
     list_display = ('safe_id', 'initial_block_number', 'tx_block_number', 'erc_20_block_number')
     raw_id_fields = ('safe',)
     search_fields = ['=safe__address']
+
+
+@admin.register(BannedSigner)
+class BannedSignerAdmin(admin.ModelAdmin):
+    list_display = ('address',)
+    search_fields = ['=address']

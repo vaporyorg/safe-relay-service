@@ -1,9 +1,7 @@
-from datetime import timedelta
 from logging import getLogger
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from django.db import IntegrityError
-from django.db.models import Q
 from django.utils import timezone
 
 from eth_account import Account
@@ -22,7 +20,8 @@ from safe_relay_service.gas_station.gas_station import (GasStation,
 from safe_relay_service.tokens.models import Token
 from safe_relay_service.tokens.price_oracles import CannotGetTokenPriceFromApi
 
-from ..models import EthereumBlock, EthereumTx, SafeContract, SafeMultisigTx
+from ..models import (BannedSigner, EthereumBlock, EthereumTx, SafeContract,
+                      SafeMultisigTx)
 from ..repositories.redis_repository import EthereumNonceLock, RedisRepository
 
 logger = getLogger(__name__)
@@ -60,6 +59,10 @@ class NotEnoughFundsForMultisigTx(TransactionServiceException):
     pass
 
 
+class InvalidOwners(TransactionServiceException):
+    pass
+
+
 class InvalidMasterCopyAddress(TransactionServiceException):
     pass
 
@@ -80,6 +83,10 @@ class GasPriceTooLow(TransactionServiceException):
     pass
 
 
+class SignerIsBanned(TransactionServiceException):
+    pass
+
+
 class TransactionEstimationWithNonce(NamedTuple):
     safe_tx_gas: int
     base_gas: int  # For old versions it will equal to `data_gas`
@@ -88,6 +95,7 @@ class TransactionEstimationWithNonce(NamedTuple):
     gas_price: int
     gas_token: str
     last_used_nonce: int
+    refund_receiver: str
 
 
 class TransactionGasTokenEstimation(NamedTuple):
@@ -131,14 +139,14 @@ class TransactionService:
         self.proxy_factory = ProxyFactory(proxy_factory_address, self.ethereum_client)
         self.tx_sender_account = Account.from_key(tx_sender_private_key)
 
-    @staticmethod
-    def _check_refund_receiver(refund_receiver: str) -> bool:
+    def _check_refund_receiver(self, refund_receiver: str) -> bool:
         """
-        We only support tx.origin as refund receiver right now
-        In the future we can also accept transactions where it is set to our service account to receive the payments.
+        Support tx.origin or relay tx sender as refund receiver.
         This would prevent that anybody can front-run our service
+        :param refund_receiver: Payment refund receiver as Ethereum checksummed address
+        :return: True if refund_receiver is ok, False otherwise
         """
-        return refund_receiver == NULL_ADDRESS
+        return refund_receiver in (NULL_ADDRESS, self.tx_sender_account.address)
 
     @staticmethod
     def _is_valid_gas_token(address: Optional[str]) -> float:
@@ -161,7 +169,7 @@ class TransactionService:
         Check that `safe_gas_price` is not too low, so that the relay gets a full refund
         for the tx. Gas_price must be always > 0, if not refunding would be disabled
         If a `gas_token` is used we need to calculate the `gas_price` in Eth
-        Gas price must be at least >= _current standard gas price_ > 0
+        Gas price must be at least >= _minimum_gas_price_ > 0
         :param gas_token: Address of token is used, `NULL_ADDRESS` or `None` if it's ETH
         :return:
         :exception GasPriceTooLow
@@ -171,44 +179,35 @@ class TransactionService:
             raise RefundMustBeEnabled('Tx internal gas price cannot be 0 or less, it was %d' % safe_gas_price)
 
         minimum_accepted_gas_price = self._get_minimum_gas_price()
-        if gas_token and gas_token != NULL_ADDRESS:
-            try:
-                gas_token_model = Token.objects.get(address=gas_token, gas=True)
-                estimated_gas_price = gas_token_model.calculate_gas_price(minimum_accepted_gas_price)
-                if safe_gas_price < estimated_gas_price:
-                    raise GasPriceTooLow('Required gas-price>=%d to use gas-token' % estimated_gas_price)
-                # We use gas station tx gas price. We cannot use internal tx's because is calculated
-                # based on the gas token
-            except Token.DoesNotExist:
-                logger.warning('Cannot retrieve gas token from db: Gas token %s not valid', gas_token)
-                raise InvalidGasToken('Gas token %s not valid' % gas_token)
-        else:
-            if safe_gas_price < minimum_accepted_gas_price:
-                raise GasPriceTooLow('Required gas-price>=%d' % minimum_accepted_gas_price)
+        estimated_gas_price = self._estimate_tx_gas_price(minimum_accepted_gas_price, gas_token)
+        if safe_gas_price < estimated_gas_price:
+            raise GasPriceTooLow('Required gas-price>=%d with gas-token=%s' % (estimated_gas_price, gas_token))
         return True
 
-    def _estimate_tx_gas_price(self, gas_token: Optional[str] = None):
-        gas_price_fast = self._get_configured_gas_price()
+    def _estimate_tx_gas_price(self, base_gas_price: int, gas_token: Optional[str] = None) -> int:
         if gas_token and gas_token != NULL_ADDRESS:
             try:
                 gas_token_model = Token.objects.get(address=gas_token, gas=True)
-                return gas_token_model.calculate_gas_price(gas_price_fast)
+                estimated_gas_price = gas_token_model.calculate_gas_price(base_gas_price)
             except Token.DoesNotExist:
                 raise InvalidGasToken('Gas token %s not found' % gas_token)
         else:
-            return gas_price_fast
+            estimated_gas_price = base_gas_price
+
+        # FIXME Remove 2 / 3, workaround to prevent frontrunning
+        return int(estimated_gas_price * 2 / 3)
 
     def _get_configured_gas_price(self) -> int:
         """
         :return: Gas price for txs
         """
-        return self.gas_station.get_gas_prices().standard
+        return self.gas_station.get_gas_prices().fast
 
     def _get_minimum_gas_price(self) -> int:
         """
         :return: Minimum gas price accepted for txs set by the user
         """
-        return self.gas_station.get_gas_prices().safe_low
+        return self.gas_station.get_gas_prices().standard
 
     def get_last_used_nonce(self, safe_address: str) -> Optional[int]:
         safe = Safe(safe_address, self.ethereum_client)
@@ -223,10 +222,10 @@ class TransactionService:
         except BadFunctionCallOutput:  # If Safe does not exist
             raise SafeDoesNotExist(f'Safe={safe_address} does not exist')
 
-    def estimate_tx(self, safe_address: str, to: str, value: int, data: str, operation: int,
+    def estimate_tx(self, safe_address: str, to: str, value: int, data: bytes, operation: int,
                     gas_token: Optional[str]) -> TransactionEstimationWithNonce:
         """
-        :return: TransactionEstimation with costs and last used nonce of safe
+        :return: TransactionEstimation with costs using the provided gas token and last used nonce of the Safe
         :raises: InvalidGasToken: If Gas Token is not valid
         """
         if not self._is_valid_gas_token(gas_token):
@@ -245,12 +244,18 @@ class TransactionService:
             safe_tx_operational_gas = safe.estimate_tx_operational_gas(len(data) if data else 0)
 
         # Can throw RelayServiceException
-        gas_price = self._estimate_tx_gas_price(gas_token)
+        gas_price = self._estimate_tx_gas_price(self._get_configured_gas_price(), gas_token)
         return TransactionEstimationWithNonce(safe_tx_gas, safe_tx_base_gas, safe_tx_base_gas, safe_tx_operational_gas,
-                                              gas_price, gas_token or NULL_ADDRESS, last_used_nonce)
+                                              gas_price, gas_token or NULL_ADDRESS, last_used_nonce,
+                                              self.tx_sender_account.address)
 
-    def estimate_tx_for_all_tokens(self, safe_address: str, to: str, value: int, data: str,
+    def estimate_tx_for_all_tokens(self, safe_address: str, to: str, value: int, data: bytes,
                                    operation: int) -> TransactionEstimationWithNonceAndGasTokens:
+        """
+        :return: TransactionEstimation with costs using ether and every gas token supported by the service,
+        with the last used nonce of the Safe
+        :raises: InvalidGasToken: If Gas Token is not valid
+        """
         safe = Safe(safe_address, self.ethereum_client)
         last_used_nonce = self.get_last_used_nonce(safe_address)
         safe_tx_gas = safe.estimate_tx_gas(to, value, data, operation)
@@ -263,12 +268,13 @@ class TransactionService:
 
         # Calculate `base_gas` for ether and calculate for tokens using the ether token price
         ether_safe_tx_base_gas = safe.estimate_tx_base_gas(to, value, data, operation, NULL_ADDRESS, safe_tx_gas)
-        gas_price = self._estimate_tx_gas_price(NULL_ADDRESS)
+        base_gas_price = self._get_configured_gas_price()
+        gas_price = self._estimate_tx_gas_price(base_gas_price, NULL_ADDRESS)
         gas_token_estimations = [TransactionGasTokenEstimation(ether_safe_tx_base_gas, gas_price, NULL_ADDRESS)]
         token_gas_difference = 50000  # 50K gas more expensive than ether
         for token in Token.objects.gas_tokens():
             try:
-                gas_price = self._estimate_tx_gas_price(token.address)
+                gas_price = self._estimate_tx_gas_price(base_gas_price, token.address)
                 gas_token_estimations.append(
                     TransactionGasTokenEstimation(ether_safe_tx_base_gas + token_gas_difference,
                                                   gas_price, token.address)
@@ -290,7 +296,7 @@ class TransactionService:
                            gas_price: int,
                            gas_token: str,
                            refund_receiver: str,
-                           nonce: int,
+                           safe_nonce: int,
                            signatures: List[Dict[str, int]]) -> SafeMultisigTx:
         """
         :return: Database model of SafeMultisigTx
@@ -303,8 +309,8 @@ class TransactionService:
                                                               defaults={'master_copy': NULL_ADDRESS})
         created = timezone.now()
 
-        if SafeMultisigTx.objects.filter(safe=safe_contract, nonce=nonce).exists():
-            raise SafeMultisigTxExists(f'Tx with nonce={nonce} for safe={safe_address} already exists in DB')
+        if SafeMultisigTx.objects.not_failed().filter(safe=safe_contract, nonce=safe_nonce).exists():
+            raise SafeMultisigTxExists(f'Tx with safe-nonce={safe_nonce} for safe={safe_address} already exists in DB')
 
         signature_pairs = [(s['v'], s['r'], s['s']) for s in signatures]
         signatures_packed = signatures_to_bytes(signature_pairs)
@@ -321,7 +327,7 @@ class TransactionService:
                 gas_price,
                 gas_token,
                 refund_receiver,
-                nonce,
+                safe_nonce,
                 signatures_packed
             )
         except SafeServiceException as exc:
@@ -329,7 +335,6 @@ class TransactionService:
 
         ethereum_tx = EthereumTx.objects.create_from_tx(tx, tx_hash)
 
-        # Fix race conditions for tx being created at the same time
         try:
             return SafeMultisigTx.objects.create(
                 created=created,
@@ -344,12 +349,12 @@ class TransactionService:
                 gas_price=gas_price,
                 gas_token=None if gas_token == NULL_ADDRESS else gas_token,
                 refund_receiver=refund_receiver,
-                nonce=nonce,
+                nonce=safe_nonce,
                 signatures=signatures_packed,
                 safe_tx_hash=safe_tx_hash,
             )
         except IntegrityError as exc:
-            raise SafeMultisigTxExists(f'Tx with nonce={nonce} for safe={safe_address} already exists in DB') from exc
+            raise SafeMultisigTxExists(f'Tx with safe_tx_hash={safe_tx_hash.hex()} already exists in DB') from exc
 
     def _send_multisig_tx(self,
                           safe_address: str,
@@ -364,7 +369,6 @@ class TransactionService:
                           refund_receiver: str,
                           safe_nonce: int,
                           signatures: bytes,
-                          tx_gas: Optional[int] = None,
                           block_identifier='latest') -> Tuple[bytes, bytes, Dict[str, Any]]:
         """
         This function calls the `send_multisig_tx` of the Safe, but has some limitations to prevent abusing
@@ -431,33 +435,60 @@ class TransactionService:
             safe_version=safe.retrieve_version()
         )
 
-        if safe_tx.signers != safe_tx.sorted_signers:
+        owners = safe.retrieve_owners()
+        signers = safe_tx.signers
+        if set(signers) - set(owners):  # All the signers must be owners
+            raise InvalidOwners('Signers=%s are not valid owners of the safe. Owners=%s', safe_tx.signers, owners)
+
+        if signers != safe_tx.sorted_signers:
             raise SignaturesNotSorted('Safe-tx-hash=%s - Signatures are not sorted by owner: %s' %
                                       (safe_tx.safe_tx_hash.hex(), safe_tx.signers))
 
-        safe_tx.call(tx_sender_address=tx_sender_address, block_identifier=block_identifier)
+        if banned_signers := BannedSigner.objects.filter(address__in=signers):
+            raise SignerIsBanned(f'Signers {list(banned_signers)} are banned')
 
         with EthereumNonceLock(self.redis, self.ethereum_client, self.tx_sender_account.address,
-                               timeout=60 * 2) as tx_nonce:
+                               lock_timeout=60 * 2) as tx_nonce:
+            logger.info('Safe=%s safe-nonce=%d Check `call()` before sending transaction', safe_address, safe_nonce)
+            # Set `gasLimit` for `call()`. It will use the same that it will be used later for execution
+            tx_gas = safe_tx.base_gas + safe_tx.safe_tx_gas + 75000
+            safe_tx.call(tx_sender_address=tx_sender_address, tx_gas=tx_gas, block_identifier=block_identifier)
+            logger.info('Safe=%s safe-nonce=%d `call()` was successful', safe_address, safe_nonce)
             tx_hash, tx = safe_tx.execute(tx_sender_private_key, tx_gas=tx_gas, tx_gas_price=tx_gas_price,
                                           tx_nonce=tx_nonce, block_identifier=block_identifier)
+            logger.info('Safe=%s, Sent transaction with nonce=%d tx-hash=%s for safe-tx-hash=%s safe-nonce=%d',
+                        safe_address, tx_nonce, tx_hash.hex(), safe_tx.safe_tx_hash.hex(), safe_tx.safe_nonce)
             return tx_hash, safe_tx.safe_tx_hash, tx
 
-    def get_pending_multisig_transactions(self, older_than: int) -> List[SafeMultisigTx]:
+    def resend(self, gas_price: int, multisig_tx: SafeMultisigTx) -> Optional[EthereumTx]:
         """
-        Get multisig txs that have not been mined after `older_than` seconds
-        :param older_than: Time in seconds for a tx to be considered pending, if 0 all will be returned
+        Resend transaction with new gas price if `gas_price` is higher than transaction gas price
+        :param gas_price:
+        :param multisig_tx:
+        :return: If a new transaction is sent is returned, `None` if not
         """
-        return SafeMultisigTx.objects.filter(
-            Q(ethereum_tx__block=None) | Q(ethereum_tx=None)
-        ).filter(
-            created__lte=timezone.now() - timedelta(seconds=older_than),
-        ).select_related(
-            'ethereum_tx'
-        )
+        if multisig_tx.ethereum_tx.gas_price < gas_price:
+            assert multisig_tx.ethereum_tx.block_id is None, 'Block is present!'
+            logger.info(
+                '%s tx gas price is %d < %d. Resending with new gas price %d',
+                multisig_tx.ethereum_tx_id, multisig_tx.ethereum_tx.gas_price, gas_price, gas_price
+            )
+            safe_tx = multisig_tx.get_safe_tx(self.ethereum_client)
+            tx_gas = safe_tx.base_gas + safe_tx.safe_tx_gas + 25000
+            tx_hash, tx = safe_tx.execute(self.tx_sender_account.key, tx_gas=tx_gas, tx_gas_price=gas_price,
+                                          tx_nonce=multisig_tx.ethereum_tx.nonce)
+            multisig_tx.ethereum_tx = EthereumTx.objects.create_from_tx(tx, tx_hash)
+            multisig_tx.full_clean(validate_unique=False)
+            multisig_tx.save(update_fields=['ethereum_tx'])
+            return multisig_tx.ethereum_tx
+        else:
+            logger.info(
+                '%s tx gas price is %d > %d. Nothing to do here',
+                multisig_tx.ethereum_tx_id, multisig_tx.ethereum_tx.gas_price, gas_price
+            )
 
     # TODO Refactor and test
-    def create_or_update_ethereum_tx(self, tx_hash: str) -> EthereumTx:
+    def create_or_update_ethereum_tx(self, tx_hash: str) -> Optional[EthereumTx]:
         try:
             ethereum_tx = EthereumTx.objects.get(tx_hash=tx_hash)
             if ethereum_tx.block is None:
@@ -471,9 +502,9 @@ class TransactionService:
             return ethereum_tx
         except EthereumTx.DoesNotExist:
             tx = self.ethereum_client.get_transaction(tx_hash)
+            tx_receipt = self.ethereum_client.get_transaction_receipt(tx_hash)
             if tx:
                 if tx_receipt:
-                    tx_receipt = self.ethereum_client.get_transaction_receipt(tx_hash)
                     ethereum_block = self.get_or_create_ethereum_block(tx_receipt.blockNumber)
                     return EthereumTx.objects.create_from_tx(tx, tx_hash, tx_receipt.gasUsed, ethereum_block)
                 return EthereumTx.objects.create_from_tx(tx, tx_hash)

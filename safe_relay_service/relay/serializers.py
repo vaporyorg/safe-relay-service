@@ -1,5 +1,8 @@
 import logging
 
+from django.conf import settings
+
+from eth_account import Account
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
@@ -40,7 +43,7 @@ class SafeCreationSerializer(ThresholdValidatorSerializerMixin, serializers.Seri
 
 
 class SafeCreation2Serializer(ThresholdValidatorSerializerMixin, serializers.Serializer):
-    salt_nonce = serializers.IntegerField(min_value=0, max_value=2**256-1)  # Uint256
+    salt_nonce = serializers.IntegerField(min_value=0, max_value=2**256 - 1)  # Uint256
     owners = serializers.ListField(child=EthereumAddressField(), min_length=1)
     threshold = serializers.IntegerField(min_value=1)
     payment_token = EthereumAddressField(default=None, allow_null=True, allow_zero_address=True)
@@ -59,8 +62,10 @@ class SafeRelayMultisigTxSerializer(SafeMultisigTxSerializer):
     signatures = serializers.ListField(child=SafeSignatureSerializer())
 
     def validate_refund_receiver(self, refund_receiver):
-        if refund_receiver and refund_receiver != NULL_ADDRESS:
-            raise ValidationError('Refund Receiver is not configurable')
+        relay_sender_address = Account.from_key(settings.SAFE_TX_SENDER_PRIVATE_KEY).address
+        if refund_receiver and refund_receiver not in (NULL_ADDRESS, relay_sender_address):
+            raise ValidationError(f'Refund Receiver must be empty, 0x00...00 address or Relay Service Sender Address: '
+                                  f'${relay_sender_address}')
         return refund_receiver
 
 
@@ -257,6 +262,7 @@ class SafeMultisigEstimateTxResponseV2Serializer(serializers.Serializer):
     gas_price = serializers.CharField()
     last_used_nonce = serializers.IntegerField(min_value=0, allow_null=True)
     gas_token = EthereumAddressField(allow_null=True, allow_zero_address=True)
+    refund_receiver = EthereumAddressField(allow_zero_address=True)
 
 
 class TransactionGasTokenEstimationResponseSerializer(serializers.Serializer):

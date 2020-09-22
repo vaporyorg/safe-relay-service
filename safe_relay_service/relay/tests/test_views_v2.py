@@ -163,8 +163,8 @@ class TestViewsV2(RelayTestCaseMixin, APITestCase):
         self.assertTrue(check_checksum(response_json['paymentReceiver']))
         self.assertEqual(response_json['paymentToken'], payment_token)
         self.assertEqual(int(response_json['payment']),
-                         int(response_json['gasEstimated']) * int(response_json['gasPriceEstimated']) *
-                         (1 / fixed_eth_conversion))
+                         int(response_json['gasEstimated']) * int(response_json['gasPriceEstimated'])
+                         * (1 / fixed_eth_conversion))
         self.assertGreater(int(response_json['gasEstimated']), 0)
         self.assertGreater(int(response_json['gasPriceEstimated']), 0)
         self.assertGreater(len(response_json['setupData']), 2)
@@ -220,13 +220,15 @@ class TestViewsV2(RelayTestCaseMixin, APITestCase):
                                     data=data,
                                     format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        response = response.json()
+        response_json = response.json()
         for field in ('safeTxGas', 'dataGas', 'gasPrice'):
-            self.assertTrue(isinstance(response[field], str))
-            self.assertGreater(int(response[field]), 0)
+            self.assertTrue(isinstance(response_json[field], str))
+            self.assertGreater(int(response_json[field]), 0)
 
-        self.assertIsNone(response['lastUsedNonce'])
-        self.assertEqual(response['gasToken'], NULL_ADDRESS)
+        expected_refund_receiver = Account.from_key(settings.SAFE_TX_SENDER_PRIVATE_KEY).address
+        self.assertIsNone(response_json['lastUsedNonce'])
+        self.assertEqual(response_json['gasToken'], NULL_ADDRESS)
+        self.assertEqual(response_json['refundReceiver'], expected_refund_receiver)
 
         to = Account.create().address
         data = {
@@ -239,6 +241,7 @@ class TestViewsV2(RelayTestCaseMixin, APITestCase):
                                     data=data,
                                     format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['refund_receiver'], expected_refund_receiver)
 
     def test_safe_signal_v2(self):
         safe_address = Account.create().address

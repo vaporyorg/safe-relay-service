@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED 1
 WORKDIR /app
 
 # Signal handling for PID1 https://github.com/krallin/tini
-ENV TINI_VERSION v0.18.0
+ENV TINI_VERSION v0.19.0
 ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
 RUN chmod +x /tini
 
@@ -27,6 +27,6 @@ RUN set -ex \
         -exec rm -rf '{}' +
 
 COPY . .
+RUN DJANGO_SETTINGS_MODULE=config.settings.local DJANGO_DOT_ENV_FILE=.env_local python manage.py collectstatic --noinput
 
-EXPOSE 8888
 ENTRYPOINT ["/tini", "--"]

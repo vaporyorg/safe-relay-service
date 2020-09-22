@@ -12,9 +12,10 @@ from redis.exceptions import LockError
 from gnosis.eth import EthereumClientProvider, TransactionAlreadyImported
 from gnosis.eth.constants import NULL_ADDRESS
 
-from safe_relay_service.relay.models import (SafeContract, SafeCreation,
-                                             SafeCreation2, SafeFunding)
+from safe_relay_service.gas_station.gas_station import GasStationProvider
 
+from .models import (SafeContract, SafeCreation, SafeCreation2, SafeFunding,
+                     SafeMultisigTx)
 from .repositories.redis_repository import RedisRepository
 from .services import (Erc20EventsServiceProvider, FundingServiceProvider,
                        NotificationServiceProvider,
@@ -97,7 +98,6 @@ def fund_deployer_task(self, safe_address: str, retry: bool = True) -> None:
                                 safe_address, safe_creation.wei_deploy_cost(), deployer_address)
                     tx_hash = FundingServiceProvider().send_eth_to(deployer_address,
                                                                    safe_creation.wei_deploy_cost(),
-                                                                   gas_price=safe_creation.gas_price,
                                                                    retry=True)
                     if tx_hash:
                         tx_hash = tx_hash.hex()
@@ -282,24 +282,24 @@ def check_create2_deployed_safes_task() -> None:
             current_block_number = ethereum_client.current_block_number
             for safe_creation2 in SafeCreation2.objects.pending_to_check():
                 tx_receipt = ethereum_client.get_transaction_receipt(safe_creation2.tx_hash)
-                safe_address = safe_creation2.safe.address
-                if tx_receipt:
-                    block_number = tx_receipt.blockNumber
+                safe_address = safe_creation2.safe_id
+                if tx_receipt and tx_receipt['blockNumber'] is not None:
+                    block_number = tx_receipt['blockNumber']
                     if (current_block_number - block_number) >= confirmations:
                         logger.info('Safe=%s with tx-hash=%s was confirmed in block-number=%d',
                                     safe_address, safe_creation2.tx_hash, block_number)
-                        send_create_notification.delay(safe_address, safe_creation2.owners)
                         safe_creation2.block_number = block_number
-                        safe_creation2.save()
+                        safe_creation2.save(update_fields=['block_number'])
+                        send_create_notification.delay(safe_address, safe_creation2.owners)
                 else:
-                    # If safe was not included in any block after 35 minutes (mempool limit is 30)
-                    # we try to deploy it again
-                    if safe_creation2.modified + timedelta(minutes=35) < timezone.now():
-                        logger.info('Safe=%s with tx-hash=%s was not deployed after 10 minutes',
-                                    safe_address, safe_creation2.tx_hash)
-                        safe_creation2.tx_hash = None
-                        safe_creation2.save()
-                        deploy_create2_safe_task.delay(safe_address, retry=False)
+                    # If safe was not included in any block after 30 minutes (mempool limit is 30 minutes)
+                    # try to increase a little the gas price
+                    if safe_creation2.modified + timedelta(minutes=30) < timezone.now():
+                        logger.warning('Safe=%s with tx-hash=%s was not deployed after 30 minutes. '
+                                       'Increasing the gas price', safe_address, safe_creation2.tx_hash)
+                        safe_creation2 = SafeCreationServiceProvider().deploy_again_create2_safe_tx(safe_address)
+                        logger.warning('Safe=%s has a new tx-hash=%s with increased gas price.', safe_address,
+                                       safe_creation2.tx_hash)
 
             for safe_creation2 in SafeCreation2.objects.not_deployed().filter(
                     created__gte=timezone.now() - timedelta(days=10)):
@@ -359,7 +359,7 @@ def find_erc_20_721_transfers_task() -> int:
 @app.shared_task(soft_time_limit=60)
 def check_pending_transactions() -> int:
     """
-    Find txs that have not been mined after a while
+    Find txs that have not been mined after a while and resend again
     :return: Number of pending transactions
     """
     number_txs = 0
@@ -367,10 +367,26 @@ def check_pending_transactions() -> int:
         redis = RedisRepository().redis
         with redis.lock('tasks:check_pending_transactions', blocking_timeout=1, timeout=60):
             tx_not_mined_alert = settings.SAFE_TX_NOT_MINED_ALERT_MINUTES
-            txs = TransactionServiceProvider().get_pending_multisig_transactions(older_than=tx_not_mined_alert * 60)
-            for tx in txs:
-                logger.error('Tx with tx-hash=%s and safe-tx-hash=%s has not been mined after a while, created=%s',
-                             tx.ethereum_tx_id, tx.safe_tx_hash, tx.created)
+            multisig_txs = SafeMultisigTx.objects.pending(
+                older_than=tx_not_mined_alert * 60
+            ).select_related(
+                'ethereum_tx'
+            )
+            for multisig_tx in multisig_txs:
+                gas_price = GasStationProvider().get_gas_prices().fast
+                old_fee = multisig_tx.ethereum_tx.fee
+                ethereum_tx = TransactionServiceProvider().resend(gas_price, multisig_tx)
+                if ethereum_tx:
+                    logger.error('Safe=%s - Tx with tx-hash=%s and safe-tx-hash=%s has not been mined after '
+                                 'a while, created=%s. Sent again with tx-hash=%s. Old fee=%d and new fee=%d',
+                                 multisig_tx.safe_id, multisig_tx.ethereum_tx_id,
+                                 multisig_tx.safe_tx_hash, multisig_tx.created, ethereum_tx.tx_hash,
+                                 old_fee, ethereum_tx.fee)
+                else:
+                    logger.error('Safe=%s - Tx with tx-hash=%s and safe-tx-hash=%s has not been mined after '
+                                 'a while, created=%s',
+                                 multisig_tx.safe_id, multisig_tx.ethereum_tx_id,
+                                 multisig_tx.safe_tx_hash, multisig_tx.created)
                 number_txs += 1
     except LockError:
         pass
@@ -388,16 +404,16 @@ def check_and_update_pending_transactions() -> int:
         redis = RedisRepository().redis
         with redis.lock('tasks:check_and_update_pending_transactions', blocking_timeout=1, timeout=60):
             transaction_service = TransactionServiceProvider()
-            txs = transaction_service.get_pending_multisig_transactions(older_than=15)
-            for tx in txs:
-                ethereum_tx = transaction_service.create_or_update_ethereum_tx(tx.ethereum_tx_id)
+            multisig_txs = SafeMultisigTx.objects.pending(older_than=15).select_related('ethereum_tx')
+            for multisig_tx in multisig_txs:
+                ethereum_tx = transaction_service.create_or_update_ethereum_tx(multisig_tx.ethereum_tx_id)
                 if ethereum_tx and ethereum_tx.block_id:
                     if ethereum_tx.success:
-                        logger.info('Tx with tx-hash=%s was mined on block=%d ', ethereum_tx.tx_hash,
-                                    ethereum_tx.block_id)
+                        logger.info('Safe=%s - Tx with tx-hash=%s was mined on block=%d ',
+                                    multisig_tx.safe_id, ethereum_tx.tx_hash, ethereum_tx.block_id)
                     else:
-                        logger.error('Tx with tx-hash=%s was mined on block=%d and failed', ethereum_tx.tx_hash,
-                                     ethereum_tx.block_id)
+                        logger.error('Safe=%s - Tx with tx-hash=%s was mined on block=%d and failed',
+                                     multisig_tx.safe_id, ethereum_tx.tx_hash, ethereum_tx.block_id)
                     number_txs += 1
     except LockError:
         pass
